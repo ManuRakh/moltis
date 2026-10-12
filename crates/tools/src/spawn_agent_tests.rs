@@ -730,6 +730,62 @@ fn test_identity_injected_into_system_prompt() {
 }
 
 #[test]
+fn test_workspace_persona_injected_into_system_prompt() {
+    let dir = tempfile::tempdir().unwrap();
+    moltis_config::set_data_dir(dir.path().to_path_buf());
+
+    let workspace = moltis_config::agent_workspace_dir("research");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::write(
+        workspace.join("SOUL.md"),
+        "SOUL_MARKER_PARITY_7F3A — be curious.\n",
+    )
+    .unwrap();
+    std::fs::write(
+        workspace.join("AGENTS.md"),
+        "<!-- mion:role -->\nROLE_MARKER_PARITY_7F3A\n<!-- /mion:role -->\nGUIDE_MARKER_PARITY_7F3A\n",
+    )
+    .unwrap();
+    std::fs::write(
+        workspace.join("GUIDELINES.md"),
+        "Extra guidelines body for spawn parity.\n",
+    )
+    .unwrap();
+    std::fs::write(
+        workspace.join("IDENTITY.md"),
+        "---\nname: Research Bot\nemoji: 🔬\ntheme: precise\n---\n",
+    )
+    .unwrap();
+
+    let preset = AgentPreset {
+        identity: AgentIdentity {
+            name: Some("fallback-name".into()),
+            emoji: None,
+            theme: None,
+        },
+        system_prompt_suffix: Some("SUFFIX_MARKER_PARITY_7F3A".into()),
+        ..Default::default()
+    };
+
+    let prompt =
+        build_sub_agent_prompt("summarize findings", "", Some(&preset), Some("research"));
+
+    assert!(prompt.contains("You are Research Bot (🔬)"));
+    assert!(prompt.contains("Your style is precise"));
+    assert!(prompt.contains("## Soul"));
+    assert!(prompt.contains("SOUL_MARKER_PARITY_7F3A"));
+    assert!(prompt.contains("## Workspace (AGENTS.md)"));
+    assert!(prompt.contains("ROLE_MARKER_PARITY_7F3A"));
+    assert!(prompt.contains("GUIDE_MARKER_PARITY_7F3A"));
+    assert!(prompt.contains("## Guidelines"));
+    assert!(prompt.contains("Extra guidelines body for spawn parity."));
+    assert!(prompt.contains("SUFFIX_MARKER_PARITY_7F3A"));
+    assert!(!prompt.contains("fallback-name"));
+
+    moltis_config::clear_data_dir();
+}
+
+#[test]
 fn test_no_identity_uses_default_prompt() {
     let prompt = build_sub_agent_prompt("do work", "", None, None);
 

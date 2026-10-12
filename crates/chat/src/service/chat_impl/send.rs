@@ -496,16 +496,29 @@ impl LiveChatService {
             return Ok(serde_json::json!({ "ok": true, "runId": run_id }));
         }
 
-        // Resolve model: explicit param → session metadata → first registered.
-        let session_model = if explicit_model.is_none() {
-            self.session_metadata
-                .get(&session_key)
-                .await
-                .and_then(|e| e.model)
+        // Resolve model: explicit → session → agent preset → first registered.
+        let session_entry_for_model = if explicit_model.is_none() {
+            self.session_metadata.get(&session_key).await
         } else {
             None
         };
-        let model_id = explicit_model.as_deref().or(session_model.as_deref());
+        let session_model = session_entry_for_model
+            .as_ref()
+            .and_then(|e| e.model.clone());
+        let preset_model = session_entry_for_model
+            .as_ref()
+            .and_then(|e| e.agent_id.as_deref())
+            .and_then(|agent_id| {
+                moltis_config::discover_and_load()
+                    .agents
+                    .get_preset(agent_id)
+                    .and_then(|p| p.model.clone())
+            });
+        let model_id = crate::prompt::resolve_chat_model_id(
+            explicit_model.as_deref(),
+            session_model.as_deref(),
+            preset_model.as_deref(),
+        );
 
         let provider_result: Result<Arc<dyn moltis_agents::model::LlmProvider>, String> = {
             let reg = self.providers.read().await;
