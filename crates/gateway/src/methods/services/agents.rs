@@ -654,6 +654,7 @@ pub(super) fn register(reg: &mut MethodRegistry) {
                                 "allow": p.skills.allow,
                                 "deny": p.skills.deny,
                             },
+                            "spawn_allow": p.spawn.allow,
                         })
                     });
                     Ok(serde_json::json!({
@@ -860,6 +861,7 @@ pub(super) fn register(reg: &mut MethodRegistry) {
                                 "tools_allow": preset.tools.allow,
                                 "tools_deny": preset.tools.deny,
                                 "delegate_only": preset.delegate_only,
+                                "spawn_allow": preset.spawn.allow,
                                 "toml": toml_str,
                                 "provenance": provenance,
                                 "deletable": markdown_backed && !toml_backed,
@@ -967,6 +969,13 @@ fn preset_from_rpc_params(
         } else {
             Some(skills_deny)
         };
+    }
+    if let Some(value) = params.get("spawn_allow") {
+        if value.is_null() {
+            preset.spawn.allow = None;
+        } else {
+            preset.spawn.allow = Some(string_list_param(params, "spawn_allow"));
+        }
     }
     Ok(preset)
 }

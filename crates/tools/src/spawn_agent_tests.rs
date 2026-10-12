@@ -1,7 +1,7 @@
 use {
     super::*,
     moltis_agents::model::{ChatMessage, CompletionResponse, StreamEvent, Usage},
-    moltis_config::schema::{AgentIdentity, PresetToolPolicy},
+    moltis_config::schema::{AgentIdentity, PresetSpawnPolicy, PresetToolPolicy},
     std::{
         path::PathBuf,
         pin::Pin,
@@ -584,6 +584,7 @@ async fn test_build_sub_tools_applies_allow_and_deny() {
         ],
         &["task_list".to_string()],
         false,
+        None,
     );
     assert!(filtered.get("exec").is_some());
     assert!(filtered.get("task_list").is_none());
@@ -611,7 +612,7 @@ async fn test_build_sub_tools_delegate_only_uses_delegate_set() {
         ]),
     );
 
-    let filtered = spawn_tool.build_sub_tools(&[], &[], true);
+    let filtered = spawn_tool.build_sub_tools(&[], &[], true, None);
     assert!(filtered.get("spawn_agent").is_some());
     assert!(filtered.get("spawn_status").is_some());
     assert!(filtered.get("spawn_result").is_some());
@@ -632,7 +633,7 @@ async fn test_delegate_only_injects_spawn_agent_with_shared_task_store() {
     let spawn_tool = SpawnAgentTool::new(make_empty_provider_registry(), provider, registry)
         .with_task_store(Arc::clone(&store));
 
-    let filtered = spawn_tool.build_sub_tools(&[], &[], true);
+    let filtered = spawn_tool.build_sub_tools(&[], &[], true, None);
     let nested_spawn = filtered.get("spawn_agent").expect("injected spawn_agent");
     let result = nested_spawn
         .execute(serde_json::json!({
@@ -956,4 +957,207 @@ async fn test_timeout_cancels_long_running_agent() {
     let result = spawn_tool.execute(params).await;
     assert!(result.is_err());
     assert!(result.unwrap_err().to_string().contains("timed out"));
+}
+
+#[tokio::test]
+async fn test_resolve_preset_rejects_target_outside_spawn_allow() {
+    let (provider, _) = MockProvider::with_capture("ok", "mock");
+    let spawn_tool = SpawnAgentTool::new(
+        make_empty_provider_registry(),
+        provider,
+        Arc::new(ToolRegistry::new()),
+    )
+    .with_agents_config(agents_config_with_presets(None, &[
+        (
+            "coordinator",
+            AgentPreset {
+                spawn: PresetSpawnPolicy {
+                    allow: Some(vec!["research".to_string()]),
+                },
+                ..Default::default()
+            },
+        ),
+        ("research", AgentPreset::default()),
+        ("writer", AgentPreset::default()),
+    ]))
+    .with_caller_agent_id("coordinator");
+
+    let denied = spawn_tool
+        .resolve_preset(&serde_json::json!({
+            "preset": "writer",
+            "_caller_agent_id": "coordinator",
+        }))
+        .await;
+    assert!(denied.is_err());
+    let message = denied.unwrap_err().to_string();
+    assert!(message.contains("spawn_agent denied"), "{message}");
+    assert!(message.contains("writer"), "{message}");
+    assert!(message.contains("research"), "{message}");
+
+    let allowed = spawn_tool
+        .resolve_preset(&serde_json::json!({
+            "preset": "research",
+            "_caller_agent_id": "coordinator",
+        }))
+        .await
+        .expect("research is allowlisted");
+    assert_eq!(allowed.0.as_deref(), Some("research"));
+}
+
+#[tokio::test]
+async fn test_resolve_preset_empty_spawn_allow_rejects_all() {
+    let (provider, _) = MockProvider::with_capture("ok", "mock");
+    let spawn_tool = SpawnAgentTool::new(
+        make_empty_provider_registry(),
+        provider,
+        Arc::new(ToolRegistry::new()),
+    )
+    .with_agents_config(agents_config_with_presets(None, &[
+        (
+            "solo",
+            AgentPreset {
+                spawn: PresetSpawnPolicy {
+                    allow: Some(vec![]),
+                },
+                ..Default::default()
+            },
+        ),
+        ("research", AgentPreset::default()),
+    ]));
+
+    let denied = spawn_tool
+        .resolve_preset(&serde_json::json!({
+            "preset": "research",
+            "_caller_agent_id": "solo",
+        }))
+        .await;
+    assert!(denied.is_err());
+    assert!(
+        denied
+            .unwrap_err()
+            .to_string()
+            .contains("spawn.allow = []")
+    );
+}
+
+#[tokio::test]
+async fn test_resolve_preset_absent_spawn_allow_unrestricted() {
+    let (provider, _) = MockProvider::with_capture("ok", "mock");
+    let spawn_tool = SpawnAgentTool::new(
+        make_empty_provider_registry(),
+        provider,
+        Arc::new(ToolRegistry::new()),
+    )
+    .with_agents_config(agents_config_with_presets(None, &[
+        ("legacy", AgentPreset::default()),
+        ("research", AgentPreset::default()),
+    ]));
+
+    let (name, _) = spawn_tool
+        .resolve_preset(&serde_json::json!({
+            "preset": "research",
+            "_caller_agent_id": "legacy",
+        }))
+        .await
+        .expect("absent spawn.allow stays unrestricted");
+    assert_eq!(name.as_deref(), Some("research"));
+}
+
+#[tokio::test]
+async fn test_spawn_allow_bound_schema_lists_only_allowed_targets() {
+    let (provider, _) = MockProvider::with_capture("ok", "mock");
+    let agents = agents_config_with_presets(None, &[
+        (
+            "coordinator",
+            AgentPreset {
+                spawn: PresetSpawnPolicy {
+                    allow: Some(vec!["research".to_string()]),
+                },
+                ..Default::default()
+            },
+        ),
+        (
+            "research",
+            AgentPreset {
+                identity: AgentIdentity {
+                    name: Some("Researcher".into()),
+                    emoji: None,
+                    theme: Some("thorough".into()),
+                },
+                ..Default::default()
+            },
+        ),
+        ("writer", AgentPreset::default()),
+    ]);
+    let agents_snapshot = agents.read().await.clone();
+    let spawn_tool = SpawnAgentTool::new(
+        make_empty_provider_registry(),
+        provider,
+        Arc::new(ToolRegistry::new()),
+    )
+    .with_agents_config(Arc::clone(&agents))
+    .with_caller_agent_id("coordinator");
+
+    let description = spawn_tool.description();
+    assert!(description.contains("research"), "{description}");
+    assert!(description.contains("only spawn"), "{description}");
+
+    let schema = spawn_tool.parameters_schema();
+    let preset_desc = schema["properties"]["preset"]["description"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(preset_desc.contains("research"), "{preset_desc}");
+    assert!(!preset_desc.contains("writer") || preset_desc.contains("Allowed"), "{preset_desc}");
+    let enum_values = schema["properties"]["preset"]["enum"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        enum_values,
+        vec![serde_json::Value::String("research".into())]
+    );
+
+    let mut registry = ToolRegistry::new();
+    registry.register(Box::new(spawn_tool));
+    bind_spawn_agent_allowlist(&mut registry, "coordinator", &agents_snapshot);
+    let bound = registry.get("spawn_agent").expect("bound spawn_agent");
+    assert!(bound.description().contains("research"));
+    assert_eq!(
+        bound.parameters_schema()["properties"]["preset"]["enum"],
+        serde_json::json!(["research"])
+    );
+}
+
+#[tokio::test]
+async fn test_execute_rejects_disallowed_preset_before_provider() {
+    let (provider, _) = MockProvider::with_capture("should-not-run", "mock");
+    let spawn_tool = SpawnAgentTool::new(
+        make_empty_provider_registry(),
+        provider,
+        Arc::new(ToolRegistry::new()),
+    )
+    .with_agents_config(agents_config_with_presets(None, &[
+        (
+            "coordinator",
+            AgentPreset {
+                spawn: PresetSpawnPolicy {
+                    allow: Some(vec!["research".to_string()]),
+                },
+                ..Default::default()
+            },
+        ),
+        ("research", AgentPreset::default()),
+        ("writer", AgentPreset::default()),
+    ]));
+
+    let result = spawn_tool
+        .execute(serde_json::json!({
+            "task": "write a blog post",
+            "preset": "writer",
+            "_caller_agent_id": "coordinator",
+        }))
+        .await;
+    assert!(result.is_err());
+    let message = result.unwrap_err().to_string();
+    assert!(message.contains("spawn_agent denied"), "{message}");
 }

@@ -43,6 +43,14 @@ const MAX_SPAWN_DEPTH: u64 = 3;
 /// Tool parameter injected via `tool_context` to track nesting depth.
 const SPAWN_DEPTH_KEY: &str = "_spawn_depth";
 
+/// Calling agent id injected via `tool_context` for `spawn.allow` checks.
+const CALLER_AGENT_ID_KEY: &str = "_caller_agent_id";
+
+const DEFAULT_SPAWN_DESCRIPTION: &str = "Spawn a sub-agent to handle a complex, multi-step task autonomously. \
+         The sub-agent runs its own agent loop with access to tools and returns \
+         the result when done. Use this to delegate tasks that require multiple \
+         tool calls or independent reasoning. Supports optional tool policy controls.";
+
 /// Minimal delegate-only toolset for coordinator-style agents.
 ///
 /// Shared by `spawn_agent` and direct-chat `delegate_only` filtering so both
@@ -88,6 +96,10 @@ pub struct SpawnAgentTool {
     on_event: Option<OnSpawnEvent>,
     session_deps: Option<SessionDeps>,
     task_store: Arc<SpawnTaskStore>,
+    /// When set, schemas/descriptions list this caller's `spawn.allow` targets.
+    caller_agent_id: Option<String>,
+    /// Cached tool description when a caller allowlist is bound.
+    bound_description: Option<String>,
 }
 
 impl SpawnAgentTool {
@@ -104,6 +116,8 @@ impl SpawnAgentTool {
             on_event: None,
             session_deps: None,
             task_store: default_spawn_task_store(),
+            caller_agent_id: None,
+            bound_description: None,
         }
     }
 
@@ -134,6 +148,21 @@ impl SpawnAgentTool {
         self
     }
 
+    /// Bind this tool instance to a calling agent so schemas list `spawn.allow`.
+    #[must_use]
+    pub fn with_caller_agent_id(mut self, caller_agent_id: impl Into<String>) -> Self {
+        let caller_agent_id = caller_agent_id.into();
+        self.bound_description = Some(describe_spawn_for_caller(
+            &caller_agent_id,
+            self.agents_config
+                .as_ref()
+                .and_then(|cfg| cfg.try_read().ok())
+                .as_deref(),
+        ));
+        self.caller_agent_id = Some(caller_agent_id);
+        self
+    }
+
     fn emit(&self, event: RunnerEvent) {
         if let Some(ref cb) = self.on_event {
             cb(event);
@@ -145,6 +174,7 @@ impl SpawnAgentTool {
         allow_tools: &[String],
         deny_tools: &[String],
         delegate_only: bool,
+        nested_caller_agent_id: Option<&str>,
     ) -> ToolRegistry {
         let mut sub_tools = if delegate_only {
             let allowed: HashSet<&str> = DELEGATE_ONLY_TOOLS.iter().copied().collect();
@@ -165,7 +195,13 @@ impl SpawnAgentTool {
         }
 
         if delegate_only && sub_tools.get("spawn_agent").is_none() {
-            sub_tools.replace(Box::new(self.child_spawn_tool()));
+            let mut child = self.child_spawn_tool();
+            if let Some(caller) = nested_caller_agent_id {
+                child = child.with_caller_agent_id(caller);
+            }
+            sub_tools.replace(Box::new(child));
+        } else if let Some(caller) = nested_caller_agent_id {
+            bind_spawn_agent_allowlist_in_registry(&mut sub_tools, caller, self.agents_config.as_ref());
         }
 
         sub_tools
@@ -180,6 +216,8 @@ impl SpawnAgentTool {
             on_event: self.on_event.clone(),
             session_deps: self.session_deps.clone(),
             task_store: Arc::clone(&self.task_store),
+            caller_agent_id: None,
+            bound_description: None,
         }
     }
 
@@ -244,7 +282,209 @@ impl SpawnAgentTool {
                 "spawn preset '{preset_name}' not found in config.agents.presets"
             ))
         })?;
+
+        let caller_id = str_param(params, CALLER_AGENT_ID_KEY)
+            .map(str::to_string)
+            .or_else(|| self.caller_agent_id.clone());
+        if let Some(caller_id) = caller_id.as_deref() {
+            enforce_spawn_allow(&agents, caller_id, &preset_name)?;
+        }
+
         Ok((Some(preset_name), Some(preset)))
+    }
+}
+
+/// Reject targets outside the calling agent's `spawn.allow` list.
+fn enforce_spawn_allow(
+    agents: &AgentsConfig,
+    caller_id: &str,
+    target_preset: &str,
+) -> crate::Result<()> {
+    let Some(caller_preset) = agents.get_preset(caller_id) else {
+        return Ok(());
+    };
+    let Some(ref allow) = caller_preset.spawn.allow else {
+        return Ok(());
+    };
+    if allow.iter().any(|id| id == target_preset) {
+        return Ok(());
+    }
+    if allow.is_empty() {
+        return Err(Error::message(format!(
+            "spawn_agent denied: agent '{caller_id}' has spawn.allow = [] (cannot spawn any preset). \
+             Asked for '{target_preset}'."
+        )));
+    }
+    Err(Error::message(format!(
+        "spawn_agent denied: preset '{target_preset}' is not in agent '{caller_id}' spawn.allow \
+         (allowed: {}). Delegation is restricted to the configured allowlist.",
+        allow.join(", ")
+    )))
+}
+
+fn describe_spawn_for_caller(caller_agent_id: &str, agents: Option<&AgentsConfig>) -> String {
+    let Some(agents) = agents else {
+        return DEFAULT_SPAWN_DESCRIPTION.to_string();
+    };
+    let Some(allow) = agents
+        .get_preset(caller_agent_id)
+        .and_then(|p| p.spawn.allow.as_ref())
+    else {
+        return DEFAULT_SPAWN_DESCRIPTION.to_string();
+    };
+    if allow.is_empty() {
+        return format!(
+            "{DEFAULT_SPAWN_DESCRIPTION} You cannot spawn any agents: \
+             '{caller_agent_id}' has spawn.allow = []. Do not call this tool."
+        );
+    }
+    let targets = format_allowed_preset_summaries(agents, allow);
+    format!(
+        "{DEFAULT_SPAWN_DESCRIPTION} You may only spawn these presets: {targets}. \
+         Other presets are rejected."
+    )
+}
+
+fn format_allowed_preset_summaries(agents: &AgentsConfig, allow: &[String]) -> String {
+    allow
+        .iter()
+        .map(|id| {
+            let label = agents
+                .get_preset(id)
+                .and_then(|p| p.identity.name.as_deref())
+                .unwrap_or(id.as_str());
+            let theme = agents
+                .get_preset(id)
+                .and_then(|p| p.identity.theme.as_deref())
+                .unwrap_or("");
+            if theme.is_empty() {
+                format!("`{id}` ({label})")
+            } else {
+                format!("`{id}` ({label}: {theme})")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn preset_param_description(caller_agent_id: Option<&str>, agents: Option<&AgentsConfig>) -> String {
+    let Some(caller_id) = caller_agent_id else {
+        return "Agent preset name (e.g. 'researcher', 'coder'). Presets define model, tool policies, and behavior.".to_string();
+    };
+    let Some(agents) = agents else {
+        return "Agent preset name (e.g. 'researcher', 'coder'). Presets define model, tool policies, and behavior.".to_string();
+    };
+    let Some(allow) = agents
+        .get_preset(caller_id)
+        .and_then(|p| p.spawn.allow.as_ref())
+    else {
+        return "Agent preset name (e.g. 'researcher', 'coder'). Presets define model, tool policies, and behavior.".to_string();
+    };
+    if allow.is_empty() {
+        return "No presets are allowed (spawn.allow = []). This call will be rejected.".to_string();
+    }
+    format!(
+        "Allowed preset names only: {}. {}",
+        allow.join(", "),
+        format_allowed_preset_summaries(agents, allow)
+    )
+}
+
+/// Replace `spawn_agent` in a per-turn registry with a caller-bound copy (schema + allowlist).
+pub fn bind_spawn_agent_allowlist(registry: &mut ToolRegistry, caller_agent_id: &str, agents: &AgentsConfig) {
+    let Some(inner) = registry.get("spawn_agent") else {
+        return;
+    };
+    // Prefer rebinding a concrete SpawnAgentTool when we can rebuild from deps via wrapper.
+    registry.replace(Box::new(SpawnCallerBoundTool::new(
+        inner,
+        caller_agent_id,
+        agents,
+    )));
+}
+
+fn bind_spawn_agent_allowlist_in_registry(
+    registry: &mut ToolRegistry,
+    caller_agent_id: &str,
+    agents_config: Option<&Arc<tokio::sync::RwLock<AgentsConfig>>>,
+) {
+    let Some(cfg) = agents_config else {
+        return;
+    };
+    let Ok(agents) = cfg.try_read() else {
+        return;
+    };
+    bind_spawn_agent_allowlist(registry, caller_agent_id, &agents);
+}
+
+/// Per-turn wrapper so concurrent sessions each see the correct `spawn.allow` schema.
+struct SpawnCallerBoundTool {
+    inner: Arc<dyn AgentTool>,
+    caller_agent_id: String,
+    description: String,
+    parameters_schema: serde_json::Value,
+}
+
+impl SpawnCallerBoundTool {
+    fn new(inner: Arc<dyn AgentTool>, caller_agent_id: &str, agents: &AgentsConfig) -> Self {
+        let description = describe_spawn_for_caller(caller_agent_id, Some(agents));
+        let mut parameters_schema = inner.parameters_schema();
+        if let Some(preset) = parameters_schema
+            .pointer_mut("/properties/preset")
+            .and_then(|value| value.as_object_mut())
+        {
+            preset.insert(
+                "description".to_string(),
+                serde_json::Value::String(preset_param_description(
+                    Some(caller_agent_id),
+                    Some(agents),
+                )),
+            );
+            if let Some(allow) = agents
+                .get_preset(caller_agent_id)
+                .and_then(|p| p.spawn.allow.as_ref())
+                && !allow.is_empty()
+            {
+                preset.insert(
+                    "enum".to_string(),
+                    serde_json::Value::Array(
+                        allow
+                            .iter()
+                            .cloned()
+                            .map(serde_json::Value::String)
+                            .collect(),
+                    ),
+                );
+            }
+        }
+        Self {
+            inner,
+            caller_agent_id: caller_agent_id.to_string(),
+            description,
+            parameters_schema,
+        }
+    }
+}
+
+#[async_trait]
+impl AgentTool for SpawnCallerBoundTool {
+    fn name(&self) -> &str {
+        "spawn_agent"
+    }
+
+    fn description(&self) -> &str {
+        &self.description
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        self.parameters_schema.clone()
+    }
+
+    async fn execute(&self, mut params: serde_json::Value) -> anyhow::Result<serde_json::Value> {
+        if params.get(CALLER_AGENT_ID_KEY).is_none() {
+            params[CALLER_AGENT_ID_KEY] = serde_json::Value::String(self.caller_agent_id.clone());
+        }
+        self.inner.execute(params).await
     }
 }
 
@@ -442,14 +682,21 @@ impl AgentTool for SpawnAgentTool {
     }
 
     fn description(&self) -> &str {
-        "Spawn a sub-agent to handle a complex, multi-step task autonomously. \
-         The sub-agent runs its own agent loop with access to tools and returns \
-         the result when done. Use this to delegate tasks that require multiple \
-         tool calls or independent reasoning. Supports optional tool policy controls."
+        self.bound_description
+            .as_deref()
+            .unwrap_or(DEFAULT_SPAWN_DESCRIPTION)
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        serde_json::json!({
+        let agents_guard = self
+            .agents_config
+            .as_ref()
+            .and_then(|cfg| cfg.try_read().ok());
+        let preset_description = preset_param_description(
+            self.caller_agent_id.as_deref(),
+            agents_guard.as_deref(),
+        );
+        let mut schema = serde_json::json!({
             "type": "object",
             "properties": {
                 "task": {
@@ -462,7 +709,7 @@ impl AgentTool for SpawnAgentTool {
                 },
                 "preset": {
                     "type": "string",
-                    "description": "Agent preset name (e.g. 'researcher', 'coder'). Presets define model, tool policies, and behavior."
+                    "description": preset_description
                 },
                 "model": {
                     "type": "string",
@@ -502,7 +749,33 @@ impl AgentTool for SpawnAgentTool {
                 }
             },
             "required": ["task"]
-        })
+        });
+        if let Some(allow) = agents_guard
+            .as_ref()
+            .and_then(|agents| {
+                self.caller_agent_id.as_deref().and_then(|caller| {
+                    agents
+                        .get_preset(caller)
+                        .and_then(|p| p.spawn.allow.as_ref())
+                })
+            })
+            && !allow.is_empty()
+            && let Some(preset) = schema
+                .pointer_mut("/properties/preset")
+                .and_then(|value| value.as_object_mut())
+        {
+            preset.insert(
+                "enum".to_string(),
+                serde_json::Value::Array(
+                    allow
+                        .iter()
+                        .cloned()
+                        .map(serde_json::Value::String)
+                        .collect(),
+                ),
+            );
+        }
+        schema
     }
 
     async fn execute(&self, params: serde_json::Value) -> anyhow::Result<serde_json::Value> {
@@ -601,7 +874,12 @@ impl AgentTool for SpawnAgentTool {
         });
 
         // Build filtered tool registry from policy knobs.
-        let mut sub_tools = self.build_sub_tools(&allow_tools, &deny_tools, delegate_only);
+        let mut sub_tools = self.build_sub_tools(
+            &allow_tools,
+            &deny_tools,
+            delegate_only,
+            preset_name.as_deref(),
+        );
 
         // Apply session access policy if the preset configures one.
         if let Some(ref p) = preset
@@ -650,6 +928,10 @@ impl AgentTool for SpawnAgentTool {
         });
         if let Some(ref key) = session_key {
             tool_context["_session_key"] = serde_json::Value::String(key.clone());
+        }
+        // Nested spawn_agent checks the sub-agent's own spawn.allow.
+        if let Some(ref name) = preset_name {
+            tool_context[CALLER_AGENT_ID_KEY] = serde_json::Value::String(name.clone());
         }
         if let Some(active_tools) = tool_controls.active_tools {
             tool_context["active_tools"] = serde_json::json!(active_tools);

@@ -393,6 +393,7 @@ pub(crate) fn build_tool_context(
     accept_language: Option<&str>,
     conn_id: Option<&str>,
     runtime_context: Option<&PromptRuntimeContext>,
+    caller_agent_id: Option<&str>,
 ) -> Value {
     let mut tool_context = serde_json::json!({
         "_session_key": session_key,
@@ -411,6 +412,9 @@ pub(crate) fn build_tool_context(
     if let Some(working_dir) = runtime_context.and_then(|context| context.host.working_dir.as_ref())
     {
         tool_context["_working_dir"] = serde_json::json!(working_dir);
+    }
+    if let Some(agent_id) = caller_agent_id.filter(|id| !id.is_empty()) {
+        tool_context["_caller_agent_id"] = serde_json::json!(agent_id);
     }
     tool_context
 }
@@ -917,7 +921,7 @@ mod tests {
         let mut runtime = PromptRuntimeContext::default();
         runtime.host.working_dir = Some("/workspace/project".into());
 
-        let context = build_tool_context("acp:test", None, None, Some(&runtime));
+        let context = build_tool_context("acp:test", None, None, Some(&runtime), Some("main"));
 
         assert_eq!(
             context.get("_working_dir").and_then(Value::as_str),
@@ -934,7 +938,13 @@ mod tests {
         runtime.host.channel_chat_id = Some("-100123".into());
         runtime.host.channel_outbound_to = Some("-100123:42".into());
 
-        let context = build_tool_context("telegram:main:-100123:42", None, None, Some(&runtime));
+        let context = build_tool_context(
+            "telegram:main:-100123:42",
+            None,
+            None,
+            Some(&runtime),
+            Some("main"),
+        );
 
         assert_eq!(context["_channel"]["account_id"], "main");
         assert_eq!(context["_channel"]["chat_id"], "-100123");

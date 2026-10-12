@@ -555,6 +555,38 @@ impl PresetSkillPolicy {
     }
 }
 
+/// Per-agent spawn target allowlist (`spawn_agent` presets this agent may call).
+///
+/// ```toml
+/// # Only spawn listed presets
+/// [agents.presets.coordinator.spawn]
+/// allow = ["research", "writer"]
+///
+/// # Deny all spawning
+/// [agents.presets.solo.spawn]
+/// allow = []
+/// ```
+///
+/// Absent / `allow` unset (`None`) keeps legacy unrestricted behaviour.
+/// `allow = []` rejects every spawn target.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PresetSpawnPolicy {
+    /// When `Some`, only these preset ids may be passed to `spawn_agent`.
+    /// `Some(vec![])` means "cannot spawn anyone".
+    /// `None` (absent) means unrestricted (migration default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow: Option<Vec<String>>,
+}
+
+impl PresetSpawnPolicy {
+    /// Returns `true` when no spawn allowlist is configured.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.allow.is_none()
+    }
+}
+
 /// Agent preset configuration.
 ///
 /// Presets define identity, model, tool policies, and system prompt for an
@@ -622,6 +654,12 @@ pub struct AgentPreset {
     /// by name or category.
     #[serde(default, skip_serializing_if = "PresetSkillPolicy::is_empty")]
     pub skills: PresetSkillPolicy,
+    /// Which agent presets this agent may spawn via `spawn_agent`.
+    ///
+    /// Enforced for the calling agent (direct chat and nested spawn). Absent
+    /// means unrestricted; `allow = []` blocks all targets.
+    #[serde(default, skip_serializing_if = "PresetSpawnPolicy::is_empty")]
+    pub spawn: PresetSpawnPolicy,
 }
 
 #[cfg(test)]

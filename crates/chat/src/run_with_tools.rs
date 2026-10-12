@@ -168,6 +168,13 @@ pub(crate) async fn run_with_tools(
             persona.config.memory.agent_write_mode,
         );
     }
+    if tools_enabled {
+        moltis_tools::spawn_agent::bind_spawn_agent_allowlist(
+            &mut filtered_registry,
+            agent_id,
+            &persona.config.agents,
+        );
+    }
     if tools_enabled
         && matches!(
             persona.config.tools.registry_mode,
@@ -1003,6 +1010,7 @@ pub(crate) async fn run_with_tools(
         accept_language.as_deref(),
         conn_id.as_deref(),
         prompt_runtime_context,
+        Some(agent_id),
     );
     tool_context["_trace_correlation_key"] = serde_json::json!(run_id);
     if let Some(controls) = tool_controls {

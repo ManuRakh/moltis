@@ -61,7 +61,7 @@ pub use {
         HomeAssistantConfig, InstrumentationConfig, LangfuseSettings, MemoryBackend,
         MemoryCitationsMode, MemoryProvider, MemoryScope, MemorySearchMergeStrategy, MemoryStyle,
         MessageQueueMode, ModePreset, ModesConfig, MoltisConfig, NgrokConfig, OtlpSettings,
-        PresetMemoryConfig, PresetToolPolicy, PromptMemoryMode, ResolvedIdentity,
+        PresetMemoryConfig, PresetSpawnPolicy, PresetToolPolicy, PromptMemoryMode, ResolvedIdentity,
         SessionAccessPolicyConfig, SessionExportMode, Timezone, ToolMode, ToolPolicyConfig,
         ToolRegistryMode, UserProfile, UserProfileWriteMode, VoiceConfig, VoiceElevenLabsConfig,
         VoiceOpenAiConfig, VoiceSttConfig, VoiceSttProvider, VoiceTtsConfig, VoiceTtsProvider,
