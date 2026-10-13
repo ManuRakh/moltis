@@ -613,6 +613,18 @@ pub(crate) fn resolve_chat_model_id<'a>(
     explicit.or(session_model).or(preset_model)
 }
 
+/// Preset model for the same agent id used when building the chat prompt (`main` fallback).
+#[must_use]
+pub(crate) fn resolve_preset_model_for_session(
+    session_entry: Option<&SessionEntry>,
+) -> Option<String> {
+    let agent_id = resolve_prompt_agent_id(session_entry);
+    moltis_config::discover_and_load()
+        .agents
+        .get_preset(&agent_id)
+        .and_then(|p| p.model.clone())
+}
+
 pub(crate) fn apply_runtime_tool_filters(
     base: &moltis_agents::tool_registry::ToolRegistry,
     config: &moltis_config::MoltisConfig,
@@ -834,8 +846,7 @@ mod tests {
                 ..Default::default()
             });
 
-        let prompt =
-            append_preset_system_prompt_suffix("base prompt".into(), &config, "support");
+        let prompt = append_preset_system_prompt_suffix("base prompt".into(), &config, "support");
         assert_eq!(prompt, "base prompt\n\nROLE_MARKER_PARITY_7F3A");
     }
 
@@ -850,8 +861,7 @@ mod tests {
                 ..Default::default()
             });
 
-        let prompt =
-            append_preset_system_prompt_suffix("base prompt".into(), &config, "support");
+        let prompt = append_preset_system_prompt_suffix("base prompt".into(), &config, "support");
         assert_eq!(prompt, "base prompt");
     }
 

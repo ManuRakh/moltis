@@ -299,6 +299,22 @@ fn load_memory_from_dir(dir: &std::path::Path, max_lines: usize) -> Option<Strin
     Some(lines.join("\n"))
 }
 
+/// Cap a workspace file the same way direct-chat prompt building does.
+fn cap_workspace_file_text(text: &str, label: &str, max_chars: usize) -> String {
+    let original_chars = text.chars().count();
+    if original_chars <= max_chars {
+        return text.to_string();
+    }
+    let taken: String = text.chars().take(max_chars).collect();
+    tracing::warn!(
+        file = label,
+        original_chars,
+        limit = max_chars,
+        "workspace file truncated for prompt size"
+    );
+    format!("{taken}...\n*({label} truncated for prompt size.)*\n")
+}
+
 /// Build the system prompt for a sub-agent, incorporating preset customizations.
 ///
 /// When `preset_name` is set, also loads the target agent's workspace persona
@@ -351,6 +367,11 @@ fn build_sub_agent_prompt(
     ));
 
     // Inject target workspace persona (Soul / Guidelines / Role markers).
+    // Cap AGENTS.md the same way direct chat does (`chat.workspace_file_max_chars`).
+    let workspace_file_max_chars = moltis_config::discover_and_load()
+        .chat
+        .workspace_file_max_chars
+        .max(1);
     if let Some(name) = preset_name {
         if let Some(soul) = moltis_config::load_soul_for_agent(name)
             .map(|s| s.trim().to_string())
@@ -365,7 +386,11 @@ fn build_sub_agent_prompt(
             .filter(|s| !s.is_empty())
         {
             prompt.push_str("## Workspace (AGENTS.md)\n\n");
-            prompt.push_str(&agents_md);
+            prompt.push_str(&cap_workspace_file_text(
+                &agents_md,
+                "AGENTS.md",
+                workspace_file_max_chars,
+            ));
             prompt.push_str("\n\n");
         }
         if let Some(guidelines) = moltis_config::load_guidelines_md_for_agent(name)

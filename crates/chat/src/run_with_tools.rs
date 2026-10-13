@@ -298,9 +298,13 @@ pub(crate) async fn run_with_tools(
         .prompt
     };
 
-    // Apply preset system_prompt_suffix (Role / Layer-A composite) in direct chat.
-    let system_prompt =
-        append_preset_system_prompt_suffix(system_prompt, &persona.config, agent_id);
+    // Apply preset system_prompt_suffix (Role / Layer-A composite) in private
+    // direct chat only — shared channels must not receive private agent body.
+    let system_prompt = if private_context {
+        append_preset_system_prompt_suffix(system_prompt, &persona.config, agent_id)
+    } else {
+        system_prompt
+    };
 
     // Layer 1: instruct the LLM to write speech-friendly output when voice is active.
     let system_prompt = apply_voice_reply_suffix(system_prompt, desired_reply_medium);

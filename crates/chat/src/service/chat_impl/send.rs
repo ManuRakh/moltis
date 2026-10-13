@@ -496,7 +496,7 @@ impl LiveChatService {
             return Ok(serde_json::json!({ "ok": true, "runId": run_id }));
         }
 
-        // Resolve model: explicit → session → agent preset → first registered.
+        // Resolve model: explicit → session → agent preset (via prompt agent id) → default.
         let session_entry_for_model = if explicit_model.is_none() {
             self.session_metadata.get(&session_key).await
         } else {
@@ -505,15 +505,11 @@ impl LiveChatService {
         let session_model = session_entry_for_model
             .as_ref()
             .and_then(|e| e.model.clone());
-        let preset_model = session_entry_for_model
-            .as_ref()
-            .and_then(|e| e.agent_id.as_deref())
-            .and_then(|agent_id| {
-                moltis_config::discover_and_load()
-                    .agents
-                    .get_preset(agent_id)
-                    .and_then(|p| p.model.clone())
-            });
+        let preset_model = if explicit_model.is_none() {
+            crate::prompt::resolve_preset_model_for_session(session_entry_for_model.as_ref())
+        } else {
+            None
+        };
         let model_id = crate::prompt::resolve_chat_model_id(
             explicit_model.as_deref(),
             session_model.as_deref(),

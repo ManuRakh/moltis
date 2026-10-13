@@ -742,15 +742,7 @@ impl LiveChatService {
         let reg = self.providers.read().await;
         let session_entry = self.session_metadata.get(session_key).await;
         let session_model = session_entry.as_ref().and_then(|e| e.model.clone());
-        let preset_model = session_entry
-            .as_ref()
-            .and_then(|e| e.agent_id.as_deref())
-            .and_then(|agent_id| {
-                moltis_config::discover_and_load()
-                    .agents
-                    .get_preset(agent_id)
-                    .and_then(|p| p.model.clone())
-            });
+        let preset_model = crate::prompt::resolve_preset_model_for_session(session_entry.as_ref());
         let history_model = history
             .iter()
             .rev()
