@@ -968,15 +968,12 @@ async fn test_resolve_preset_rejects_target_outside_spawn_allow() {
         Arc::new(ToolRegistry::new()),
     )
     .with_agents_config(agents_config_with_presets(None, &[
-        (
-            "coordinator",
-            AgentPreset {
-                spawn: PresetSpawnPolicy {
-                    allow: Some(vec!["research".to_string()]),
-                },
-                ..Default::default()
+        ("coordinator", AgentPreset {
+            spawn: PresetSpawnPolicy {
+                allow: Some(vec!["research".to_string()]),
             },
-        ),
+            ..Default::default()
+        }),
         ("research", AgentPreset::default()),
         ("writer", AgentPreset::default()),
     ]))
@@ -1005,6 +1002,65 @@ async fn test_resolve_preset_rejects_target_outside_spawn_allow() {
 }
 
 #[tokio::test]
+async fn test_resolve_preset_restricted_caller_rejects_missing_preset() {
+    let (provider, _) = MockProvider::with_capture("ok", "mock");
+    let spawn_tool = SpawnAgentTool::new(
+        make_empty_provider_registry(),
+        provider,
+        Arc::new(ToolRegistry::new()),
+    )
+    .with_agents_config(agents_config_with_presets(None, &[
+        ("solo", AgentPreset {
+            spawn: PresetSpawnPolicy {
+                allow: Some(vec![]),
+            },
+            ..Default::default()
+        }),
+        ("coordinator", AgentPreset {
+            spawn: PresetSpawnPolicy {
+                allow: Some(vec!["research".to_string()]),
+            },
+            ..Default::default()
+        }),
+        ("research", AgentPreset::default()),
+    ]));
+
+    let deny_all = spawn_tool
+        .resolve_preset(&serde_json::json!({
+            "_caller_agent_id": "solo",
+        }))
+        .await;
+    assert!(deny_all.is_err());
+    let deny_all_msg = deny_all.unwrap_err().to_string();
+    assert!(
+        deny_all_msg.contains("spawn_agent denied"),
+        "{deny_all_msg}"
+    );
+    assert!(deny_all_msg.contains("spawn.allow = []"), "{deny_all_msg}");
+
+    let allowlist = spawn_tool
+        .resolve_preset(&serde_json::json!({
+            "_caller_agent_id": "coordinator",
+        }))
+        .await;
+    assert!(allowlist.is_err());
+    let allowlist_msg = allowlist.unwrap_err().to_string();
+    assert!(
+        allowlist_msg.contains("requires an allowlisted preset"),
+        "{allowlist_msg}"
+    );
+
+    // Unrestricted callers may still omit preset when default_preset is unset.
+    let unrestricted = spawn_tool
+        .resolve_preset(&serde_json::json!({
+            "_caller_agent_id": "research",
+        }))
+        .await
+        .expect("absent spawn.allow stays unrestricted without a named preset");
+    assert_eq!(unrestricted.0, None);
+}
+
+#[tokio::test]
 async fn test_resolve_preset_empty_spawn_allow_rejects_all() {
     let (provider, _) = MockProvider::with_capture("ok", "mock");
     let spawn_tool = SpawnAgentTool::new(
@@ -1013,15 +1069,12 @@ async fn test_resolve_preset_empty_spawn_allow_rejects_all() {
         Arc::new(ToolRegistry::new()),
     )
     .with_agents_config(agents_config_with_presets(None, &[
-        (
-            "solo",
-            AgentPreset {
-                spawn: PresetSpawnPolicy {
-                    allow: Some(vec![]),
-                },
-                ..Default::default()
+        ("solo", AgentPreset {
+            spawn: PresetSpawnPolicy {
+                allow: Some(vec![]),
             },
-        ),
+            ..Default::default()
+        }),
         ("research", AgentPreset::default()),
     ]));
 
@@ -1032,12 +1085,7 @@ async fn test_resolve_preset_empty_spawn_allow_rejects_all() {
         }))
         .await;
     assert!(denied.is_err());
-    assert!(
-        denied
-            .unwrap_err()
-            .to_string()
-            .contains("spawn.allow = []")
-    );
+    assert!(denied.unwrap_err().to_string().contains("spawn.allow = []"));
 }
 
 #[tokio::test]
@@ -1067,26 +1115,20 @@ async fn test_resolve_preset_absent_spawn_allow_unrestricted() {
 async fn test_spawn_allow_bound_schema_lists_only_allowed_targets() {
     let (provider, _) = MockProvider::with_capture("ok", "mock");
     let agents = agents_config_with_presets(None, &[
-        (
-            "coordinator",
-            AgentPreset {
-                spawn: PresetSpawnPolicy {
-                    allow: Some(vec!["research".to_string()]),
-                },
-                ..Default::default()
+        ("coordinator", AgentPreset {
+            spawn: PresetSpawnPolicy {
+                allow: Some(vec!["research".to_string()]),
             },
-        ),
-        (
-            "research",
-            AgentPreset {
-                identity: AgentIdentity {
-                    name: Some("Researcher".into()),
-                    emoji: None,
-                    theme: Some("thorough".into()),
-                },
-                ..Default::default()
+            ..Default::default()
+        }),
+        ("research", AgentPreset {
+            identity: AgentIdentity {
+                name: Some("Researcher".into()),
+                emoji: None,
+                theme: Some("thorough".into()),
             },
-        ),
+            ..Default::default()
+        }),
         ("writer", AgentPreset::default()),
     ]);
     let agents_snapshot = agents.read().await.clone();
@@ -1107,15 +1149,17 @@ async fn test_spawn_allow_bound_schema_lists_only_allowed_targets() {
         .as_str()
         .unwrap_or_default();
     assert!(preset_desc.contains("research"), "{preset_desc}");
-    assert!(!preset_desc.contains("writer") || preset_desc.contains("Allowed"), "{preset_desc}");
+    assert!(
+        !preset_desc.contains("writer") || preset_desc.contains("Allowed"),
+        "{preset_desc}"
+    );
     let enum_values = schema["properties"]["preset"]["enum"]
         .as_array()
         .cloned()
         .unwrap_or_default();
-    assert_eq!(
-        enum_values,
-        vec![serde_json::Value::String("research".into())]
-    );
+    assert_eq!(enum_values, vec![serde_json::Value::String(
+        "research".into()
+    )]);
 
     let mut registry = ToolRegistry::new();
     registry.register(Box::new(spawn_tool));
@@ -1137,15 +1181,12 @@ async fn test_execute_rejects_disallowed_preset_before_provider() {
         Arc::new(ToolRegistry::new()),
     )
     .with_agents_config(agents_config_with_presets(None, &[
-        (
-            "coordinator",
-            AgentPreset {
-                spawn: PresetSpawnPolicy {
-                    allow: Some(vec!["research".to_string()]),
-                },
-                ..Default::default()
+        ("coordinator", AgentPreset {
+            spawn: PresetSpawnPolicy {
+                allow: Some(vec!["research".to_string()]),
             },
-        ),
+            ..Default::default()
+        }),
         ("research", AgentPreset::default()),
         ("writer", AgentPreset::default()),
     ]));

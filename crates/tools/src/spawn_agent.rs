@@ -201,7 +201,11 @@ impl SpawnAgentTool {
             }
             sub_tools.replace(Box::new(child));
         } else if let Some(caller) = nested_caller_agent_id {
-            bind_spawn_agent_allowlist_in_registry(&mut sub_tools, caller, self.agents_config.as_ref());
+            bind_spawn_agent_allowlist_in_registry(
+                &mut sub_tools,
+                caller,
+                self.agents_config.as_ref(),
+            );
         }
 
         sub_tools
@@ -274,6 +278,19 @@ impl SpawnAgentTool {
 
         let agents = agents_config.read().await;
         let preset_name = explicit_name.or_else(|| agents.default_preset.clone());
+        let caller_id = str_param(params, CALLER_AGENT_ID_KEY)
+            .map(str::to_string)
+            .or_else(|| self.caller_agent_id.clone());
+
+        // Restricted callers must not bypass the allowlist via a missing
+        // default_preset / omitted `preset` (legacy unrestricted path).
+        if let Some(caller_id) = caller_id.as_deref() {
+            match preset_name.as_deref() {
+                Some(target) => enforce_spawn_allow(&agents, caller_id, target)?,
+                None => enforce_spawn_allow_named_target(&agents, caller_id)?,
+            }
+        }
+
         let Some(preset_name) = preset_name else {
             return Ok((None, None));
         };
@@ -283,15 +300,29 @@ impl SpawnAgentTool {
             ))
         })?;
 
-        let caller_id = str_param(params, CALLER_AGENT_ID_KEY)
-            .map(str::to_string)
-            .or_else(|| self.caller_agent_id.clone());
-        if let Some(caller_id) = caller_id.as_deref() {
-            enforce_spawn_allow(&agents, caller_id, &preset_name)?;
-        }
-
         Ok((Some(preset_name), Some(preset)))
     }
+}
+
+/// When `spawn.allow` is configured, omit/`null` default_preset cannot start an anonymous spawn.
+fn enforce_spawn_allow_named_target(agents: &AgentsConfig, caller_id: &str) -> crate::Result<()> {
+    let Some(caller_preset) = agents.get_preset(caller_id) else {
+        return Ok(());
+    };
+    let Some(ref allow) = caller_preset.spawn.allow else {
+        return Ok(());
+    };
+    if allow.is_empty() {
+        return Err(Error::message(format!(
+            "spawn_agent denied: agent '{caller_id}' has spawn.allow = [] (cannot spawn any preset). \
+             No preset was specified and agents.default_preset is unset."
+        )));
+    }
+    Err(Error::message(format!(
+        "spawn_agent denied: agent '{caller_id}' requires an allowlisted preset \
+         (allowed: {}). No preset was specified and agents.default_preset is unset.",
+        allow.join(", ")
+    )))
 }
 
 /// Reject targets outside the calling agent's `spawn.allow` list.
@@ -367,7 +398,10 @@ fn format_allowed_preset_summaries(agents: &AgentsConfig, allow: &[String]) -> S
         .join("; ")
 }
 
-fn preset_param_description(caller_agent_id: Option<&str>, agents: Option<&AgentsConfig>) -> String {
+fn preset_param_description(
+    caller_agent_id: Option<&str>,
+    agents: Option<&AgentsConfig>,
+) -> String {
     let Some(caller_id) = caller_agent_id else {
         return "Agent preset name (e.g. 'researcher', 'coder'). Presets define model, tool policies, and behavior.".to_string();
     };
@@ -381,7 +415,8 @@ fn preset_param_description(caller_agent_id: Option<&str>, agents: Option<&Agent
         return "Agent preset name (e.g. 'researcher', 'coder'). Presets define model, tool policies, and behavior.".to_string();
     };
     if allow.is_empty() {
-        return "No presets are allowed (spawn.allow = []). This call will be rejected.".to_string();
+        return "No presets are allowed (spawn.allow = []). This call will be rejected."
+            .to_string();
     }
     format!(
         "Allowed preset names only: {}. {}",
@@ -391,7 +426,11 @@ fn preset_param_description(caller_agent_id: Option<&str>, agents: Option<&Agent
 }
 
 /// Replace `spawn_agent` in a per-turn registry with a caller-bound copy (schema + allowlist).
-pub fn bind_spawn_agent_allowlist(registry: &mut ToolRegistry, caller_agent_id: &str, agents: &AgentsConfig) {
+pub fn bind_spawn_agent_allowlist(
+    registry: &mut ToolRegistry,
+    caller_agent_id: &str,
+    agents: &AgentsConfig,
+) {
     let Some(inner) = registry.get("spawn_agent") else {
         return;
     };
@@ -692,10 +731,8 @@ impl AgentTool for SpawnAgentTool {
             .agents_config
             .as_ref()
             .and_then(|cfg| cfg.try_read().ok());
-        let preset_description = preset_param_description(
-            self.caller_agent_id.as_deref(),
-            agents_guard.as_deref(),
-        );
+        let preset_description =
+            preset_param_description(self.caller_agent_id.as_deref(), agents_guard.as_deref());
         let mut schema = serde_json::json!({
             "type": "object",
             "properties": {
@@ -750,16 +787,13 @@ impl AgentTool for SpawnAgentTool {
             },
             "required": ["task"]
         });
-        if let Some(allow) = agents_guard
-            .as_ref()
-            .and_then(|agents| {
-                self.caller_agent_id.as_deref().and_then(|caller| {
-                    agents
-                        .get_preset(caller)
-                        .and_then(|p| p.spawn.allow.as_ref())
-                })
+        if let Some(allow) = agents_guard.as_ref().and_then(|agents| {
+            self.caller_agent_id.as_deref().and_then(|caller| {
+                agents
+                    .get_preset(caller)
+                    .and_then(|p| p.spawn.allow.as_ref())
             })
-            && !allow.is_empty()
+        }) && !allow.is_empty()
             && let Some(preset) = schema
                 .pointer_mut("/properties/preset")
                 .and_then(|value| value.as_object_mut())
