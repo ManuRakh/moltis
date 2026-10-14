@@ -46,6 +46,9 @@ const SPAWN_DEPTH_KEY: &str = "_spawn_depth";
 /// Calling agent id injected via `tool_context` for `spawn.allow` checks.
 const CALLER_AGENT_ID_KEY: &str = "_caller_agent_id";
 
+/// Owner-private flag injected via `tool_context` (defaults to true when absent).
+const PRIVATE_CONTEXT_KEY: &str = "_private_context";
+
 const DEFAULT_SPAWN_DESCRIPTION: &str = "Spawn a sub-agent to handle a complex, multi-step task autonomously. \
          The sub-agent runs its own agent loop with access to tools and returns \
          the result when done. Use this to delegate tasks that require multiple \
@@ -594,22 +597,37 @@ fn cap_workspace_file_text(text: &str, label: &str, max_chars: usize) -> String 
     format!("{taken}...\n*({label} truncated for prompt size.)*\n")
 }
 
+/// Whether tool params allow owner-private workspace text (matches chat policy).
+fn allows_private_context(params: &serde_json::Value) -> bool {
+    match params.get(PRIVATE_CONTEXT_KEY) {
+        None => true,
+        Some(serde_json::Value::Bool(value)) => *value,
+        Some(_) => false,
+    }
+}
+
 /// Build the system prompt for a sub-agent, incorporating preset customizations.
 ///
-/// When `preset_name` is set, also loads the target agent's workspace persona
-/// (`IDENTITY.md` / `SOUL.md` / `AGENTS.md` / `GUIDELINES.md`) so spawn matches
-/// direct-chat behaviour for Soul / Guidelines / Role (via AGENTS.md markers).
+/// When `private_context` is true and `preset_name` is set, also loads the target
+/// agent's workspace persona (`IDENTITY.md` / `SOUL.md` / `AGENTS.md` /
+/// `GUIDELINES.md`) so spawn matches direct-chat behaviour for Soul / Guidelines /
+/// Role (via AGENTS.md markers). Shared/untrusted turns skip those private files.
 fn build_sub_agent_prompt(
     task: &str,
     context: &str,
     preset: Option<&AgentPreset>,
     preset_name: Option<&str>,
+    private_context: bool,
 ) -> String {
     let mut prompt = String::new();
 
     // Prefer workspace identity for the target agent; fall back to preset fields.
-    let workspace_identity =
-        preset_name.and_then(|name| moltis_config::load_identity_for_agent(name));
+    // Skip workspace identity on non-private turns (main can fall back to root).
+    let workspace_identity = if private_context {
+        preset_name.and_then(|name| moltis_config::load_identity_for_agent(name))
+    } else {
+        None
+    };
     let identity_name = workspace_identity
         .as_ref()
         .and_then(|id| id.name.as_deref())
@@ -647,50 +665,53 @@ fn build_sub_agent_prompt(
 
     // Inject target workspace persona (Soul / Guidelines / Role markers).
     // Cap AGENTS.md the same way direct chat does (`chat.workspace_file_max_chars`).
-    let workspace_file_max_chars = moltis_config::discover_and_load()
-        .chat
-        .workspace_file_max_chars
-        .max(1);
-    if let Some(name) = preset_name {
-        if let Some(soul) = moltis_config::load_soul_for_agent(name)
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-        {
-            prompt.push_str("## Soul\n\n");
-            prompt.push_str(&soul);
-            prompt.push_str("\n\n");
+    // Shared channels must not receive private workspace text or root fallbacks.
+    if private_context {
+        let workspace_file_max_chars = moltis_config::discover_and_load()
+            .chat
+            .workspace_file_max_chars
+            .max(1);
+        if let Some(name) = preset_name {
+            if let Some(soul) = moltis_config::load_soul_for_agent(name)
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+            {
+                prompt.push_str("## Soul\n\n");
+                prompt.push_str(&soul);
+                prompt.push_str("\n\n");
+            }
+            if let Some(agents_md) = moltis_config::load_agents_md_for_agent(name)
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+            {
+                prompt.push_str("## Workspace (AGENTS.md)\n\n");
+                prompt.push_str(&cap_workspace_file_text(
+                    &agents_md,
+                    "AGENTS.md",
+                    workspace_file_max_chars,
+                ));
+                prompt.push_str("\n\n");
+            }
+            if let Some(guidelines) = moltis_config::load_guidelines_md_for_agent(name)
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+            {
+                prompt.push_str("## Guidelines\n\n");
+                prompt.push_str(&guidelines);
+                prompt.push_str("\n\n");
+            }
         }
-        if let Some(agents_md) = moltis_config::load_agents_md_for_agent(name)
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-        {
-            prompt.push_str("## Workspace (AGENTS.md)\n\n");
-            prompt.push_str(&cap_workspace_file_text(
-                &agents_md,
-                "AGENTS.md",
-                workspace_file_max_chars,
-            ));
-            prompt.push_str("\n\n");
-        }
-        if let Some(guidelines) = moltis_config::load_guidelines_md_for_agent(name)
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-        {
-            prompt.push_str("## Guidelines\n\n");
-            prompt.push_str(&guidelines);
-            prompt.push_str("\n\n");
-        }
-    }
 
-    // Inject persistent memory if configured.
-    if let Some(p) = preset
-        && let Some(ref mem_config) = p.memory
-        && let Some(name) = preset_name
-        && let Some(memory_content) = load_memory_context(name, mem_config)
-    {
-        prompt.push_str("# Agent Memory\n\n");
-        prompt.push_str(&memory_content);
-        prompt.push_str("\n\n");
+        // Inject persistent memory if configured.
+        if let Some(p) = preset
+            && let Some(ref mem_config) = p.memory
+            && let Some(name) = preset_name
+            && let Some(memory_content) = load_memory_context(name, mem_config)
+        {
+            prompt.push_str("# Agent Memory\n\n");
+            prompt.push_str(&memory_content);
+            prompt.push_str("\n\n");
+        }
     }
 
     // Add task.
@@ -702,10 +723,12 @@ fn build_sub_agent_prompt(
     }
 
     // Add preset system prompt suffix (Role / composite Layer-A content).
-    if let Some(extra) = preset
-        .and_then(|p| p.system_prompt_suffix.as_ref())
-        .map(|s| s.trim())
-        .filter(|v| !v.is_empty())
+    // Private-only — matches direct-chat `append_preset_system_prompt_suffix`.
+    if private_context
+        && let Some(extra) = preset
+            .and_then(|p| p.system_prompt_suffix.as_ref())
+            .map(|s| s.trim())
+            .filter(|v| !v.is_empty())
     {
         prompt.push_str("\n\n");
         prompt.push_str(extra);
@@ -949,8 +972,16 @@ impl AgentTool for SpawnAgentTool {
         }
 
         // Build system prompt with identity injection and memory.
-        let system_prompt =
-            build_sub_agent_prompt(task, context, preset.as_ref(), preset_name.as_deref());
+        // Shared/untrusted turns keep `_private_context = false` so children
+        // cannot quote SOUL/AGENTS/GUIDELINES (or root fallbacks).
+        let private_context = allows_private_context(&params);
+        let system_prompt = build_sub_agent_prompt(
+            task,
+            context,
+            preset.as_ref(),
+            preset_name.as_deref(),
+            private_context,
+        );
 
         // Build tool context with incremented depth and propagated session key.
         let session_key = params
@@ -959,6 +990,7 @@ impl AgentTool for SpawnAgentTool {
             .map(String::from);
         let mut tool_context = serde_json::json!({
             SPAWN_DEPTH_KEY: depth + 1,
+            PRIVATE_CONTEXT_KEY: private_context,
         });
         if let Some(ref key) = session_key {
             tool_context["_session_key"] = serde_json::Value::String(key.clone());

@@ -756,7 +756,13 @@ fn test_identity_injected_into_system_prompt() {
         ..Default::default()
     };
 
-    let prompt = build_sub_agent_prompt("find bugs", "in main.rs", Some(&preset), Some("scout"));
+    let prompt = build_sub_agent_prompt(
+        "find bugs",
+        "in main.rs",
+        Some(&preset),
+        Some("scout"),
+        true,
+    );
 
     assert!(prompt.contains("You are scout (🔍)"));
     assert!(prompt.contains("Your style is thorough"));
@@ -803,7 +809,13 @@ fn test_workspace_persona_injected_into_system_prompt() {
         ..Default::default()
     };
 
-    let prompt = build_sub_agent_prompt("summarize findings", "", Some(&preset), Some("research"));
+    let prompt = build_sub_agent_prompt(
+        "summarize findings",
+        "",
+        Some(&preset),
+        Some("research"),
+        true,
+    );
 
     assert!(prompt.contains("You are Research Bot (🔬)"));
     assert!(prompt.contains("Your style is precise"));
@@ -816,6 +828,55 @@ fn test_workspace_persona_injected_into_system_prompt() {
     assert!(prompt.contains("Extra guidelines body for spawn parity."));
     assert!(prompt.contains("SUFFIX_MARKER_PARITY_7F3A"));
     assert!(!prompt.contains("fallback-name"));
+}
+
+#[test]
+fn test_workspace_persona_skipped_without_private_context() {
+    let dir = tempfile::tempdir().unwrap();
+    let _guard = DataDirOverrideGuard::acquire(dir.path().to_path_buf());
+
+    let workspace = moltis_config::agent_workspace_dir("research");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::write(workspace.join("SOUL.md"), "SOUL_PRIVATE_LEAK\n").unwrap();
+    std::fs::write(workspace.join("AGENTS.md"), "AGENTS_PRIVATE_LEAK\n").unwrap();
+    std::fs::write(workspace.join("GUIDELINES.md"), "GUIDE_PRIVATE_LEAK\n").unwrap();
+    // Root fallback that must also stay out of shared-channel spawns.
+    std::fs::write(dir.path().join("AGENTS.md"), "ROOT_AGENTS_PRIVATE_LEAK\n").unwrap();
+    std::fs::write(
+        workspace.join("IDENTITY.md"),
+        "---\nname: Research Bot\nemoji: 🔬\ntheme: precise\n---\n",
+    )
+    .unwrap();
+
+    let preset = AgentPreset {
+        identity: AgentIdentity {
+            name: Some("public-name".into()),
+            emoji: Some("📎".into()),
+            theme: Some("brief".into()),
+        },
+        system_prompt_suffix: Some("SUFFIX_PRIVATE_LEAK".into()),
+        ..Default::default()
+    };
+
+    let prompt = build_sub_agent_prompt(
+        "summarize findings",
+        "",
+        Some(&preset),
+        Some("research"),
+        false,
+    );
+
+    assert!(prompt.contains("You are public-name (📎)"));
+    assert!(prompt.contains("Your style is brief"));
+    assert!(!prompt.contains("Research Bot"));
+    assert!(!prompt.contains("## Soul"));
+    assert!(!prompt.contains("SOUL_PRIVATE_LEAK"));
+    assert!(!prompt.contains("## Workspace (AGENTS.md)"));
+    assert!(!prompt.contains("AGENTS_PRIVATE_LEAK"));
+    assert!(!prompt.contains("ROOT_AGENTS_PRIVATE_LEAK"));
+    assert!(!prompt.contains("## Guidelines"));
+    assert!(!prompt.contains("GUIDE_PRIVATE_LEAK"));
+    assert!(!prompt.contains("SUFFIX_PRIVATE_LEAK"));
 }
 
 #[test]
@@ -832,7 +893,7 @@ fn test_workspace_agents_md_respects_size_cap() {
     let huge = "X".repeat(max + 64);
     std::fs::write(workspace.join("AGENTS.md"), &huge).unwrap();
 
-    let prompt = build_sub_agent_prompt("trim guides", "", None, Some("bulky"));
+    let prompt = build_sub_agent_prompt("trim guides", "", None, Some("bulky"), true);
     assert!(prompt.contains("## Workspace (AGENTS.md)"));
     assert!(prompt.contains("AGENTS.md truncated for prompt size"));
     assert!(prompt.contains(&"X".repeat(32)));
@@ -845,7 +906,7 @@ fn test_no_identity_uses_default_prompt() {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let managed_files = moltis_config::managed_files_dir().display().to_string();
-    let prompt = build_sub_agent_prompt("do work", "", None, None);
+    let prompt = build_sub_agent_prompt("do work", "", None, None, true);
 
     assert!(prompt.contains("You are a sub-agent"));
     assert!(prompt.contains("Task: do work"));
