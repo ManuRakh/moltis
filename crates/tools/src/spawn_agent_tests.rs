@@ -2,20 +2,44 @@ use {
     super::*,
     moltis_agents::model::{ChatMessage, CompletionResponse, StreamEvent, Usage},
     moltis_config::schema::{AgentIdentity, PresetToolPolicy},
-    std::{pin::Pin, sync::Mutex},
+    std::{
+        path::PathBuf,
+        pin::Pin,
+        sync::{Mutex, MutexGuard},
+    },
     tokio::sync::Notify,
     tokio_stream::Stream,
 };
 
 use crate::spawn_agent_tasks::{SpawnCancelTool, SpawnResultTool, SpawnStatusTool};
 
-/// Serialize tests that override the process-wide data directory.
-static DATA_DIR_TEST_LOCK: Mutex<()> = Mutex::new(());
+/// Process-wide data-dir override for tests that touch workspace files.
+struct TestDataDirState {
+    path: Option<PathBuf>,
+}
 
-struct DataDirOverrideGuard;
+/// Serialize tests that override the process-wide data directory.
+/// The mutex guards the override path itself (not a void sentinel).
+static DATA_DIR_TEST_LOCK: Mutex<TestDataDirState> = Mutex::new(TestDataDirState { path: None });
+
+struct DataDirOverrideGuard {
+    _lock: MutexGuard<'static, TestDataDirState>,
+}
+
+impl DataDirOverrideGuard {
+    fn acquire(path: PathBuf) -> Self {
+        let mut lock = DATA_DIR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        moltis_config::set_data_dir(path.clone());
+        lock.path = Some(path);
+        Self { _lock: lock }
+    }
+}
 
 impl Drop for DataDirOverrideGuard {
     fn drop(&mut self) {
+        self._lock.path = None;
         moltis_config::clear_data_dir();
     }
 }
@@ -742,12 +766,8 @@ fn test_identity_injected_into_system_prompt() {
 
 #[test]
 fn test_workspace_persona_injected_into_system_prompt() {
-    let _lock = DATA_DIR_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let dir = tempfile::tempdir().unwrap();
-    moltis_config::set_data_dir(dir.path().to_path_buf());
-    let _guard = DataDirOverrideGuard;
+    let _guard = DataDirOverrideGuard::acquire(dir.path().to_path_buf());
 
     let workspace = moltis_config::agent_workspace_dir("research");
     std::fs::create_dir_all(&workspace).unwrap();
@@ -799,12 +819,8 @@ fn test_workspace_persona_injected_into_system_prompt() {
 
 #[test]
 fn test_workspace_agents_md_respects_size_cap() {
-    let _lock = DATA_DIR_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let dir = tempfile::tempdir().unwrap();
-    moltis_config::set_data_dir(dir.path().to_path_buf());
-    let _guard = DataDirOverrideGuard;
+    let _guard = DataDirOverrideGuard::acquire(dir.path().to_path_buf());
 
     let workspace = moltis_config::agent_workspace_dir("bulky");
     std::fs::create_dir_all(&workspace).unwrap();
