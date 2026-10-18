@@ -71,8 +71,14 @@ pub fn data_dir_override() -> Option<PathBuf> {
         .clone()
 }
 
+/// Saved override guarded by the sync data-dir test lock (must not be `Mutex<()>`).
+struct TestDataDirState {
+    previous: Option<PathBuf>,
+}
+
 /// Process-wide lock for sync tests that temporarily override the data directory.
-static TEST_DATA_DIR_LOCK: Mutex<()> = Mutex::new(());
+static TEST_DATA_DIR_LOCK: Mutex<TestDataDirState> =
+    Mutex::new(TestDataDirState { previous: None });
 
 /// RAII guard that serializes sync data-dir overrides and restores the previous
 /// override (or clears it) when dropped.
@@ -81,28 +87,24 @@ static TEST_DATA_DIR_LOCK: Mutex<()> = Mutex::new(());
 /// tests should use their own `tokio::sync::Mutex` plus [`TestDataDirRestore`]
 /// so the lock can be held across `.await` points.
 pub struct TestDataDirGuard {
-    previous: Option<PathBuf>,
-    _lock: std::sync::MutexGuard<'static, ()>,
+    lock: std::sync::MutexGuard<'static, TestDataDirState>,
 }
 
 impl TestDataDirGuard {
     /// Acquire the shared sync test lock, save the current override, and install `path`.
     pub fn set(path: PathBuf) -> Self {
-        let lock = TEST_DATA_DIR_LOCK
+        let mut lock = TEST_DATA_DIR_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let previous = data_dir_override();
+        lock.previous = data_dir_override();
         set_data_dir(path);
-        Self {
-            previous,
-            _lock: lock,
-        }
+        Self { lock }
     }
 }
 
 impl Drop for TestDataDirGuard {
     fn drop(&mut self) {
-        match self.previous.take() {
+        match self.lock.previous.take() {
             Some(path) => set_data_dir(path),
             None => clear_data_dir(),
         }
