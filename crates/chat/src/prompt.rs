@@ -821,7 +821,8 @@ mod tests {
     #[test]
     fn resolve_prompt_agent_id_falls_back_to_runtime_default_not_hardcoded_main() {
         let tmp = tempfile::tempdir().unwrap();
-        moltis_config::set_data_dir(tmp.path().to_path_buf());
+        // Shared guard: serializes with other data-dir tests and restores prior override.
+        let _guard = moltis_config::TestDataDirGuard::set(tmp.path().to_path_buf());
         std::fs::write(tmp.path().join("default_agent_id"), "content-writer").unwrap();
 
         assert_eq!(runtime_default_agent_id(), "content-writer");

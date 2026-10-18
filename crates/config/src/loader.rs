@@ -63,11 +63,73 @@ pub fn clear_data_dir() {
     *DATA_DIR_OVERRIDE.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
-fn data_dir_override() -> Option<PathBuf> {
+/// Returns the programmatic data-directory override set via [`set_data_dir`], if any.
+pub fn data_dir_override() -> Option<PathBuf> {
     DATA_DIR_OVERRIDE
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone()
+}
+
+/// Process-wide lock for sync tests that temporarily override the data directory.
+static TEST_DATA_DIR_LOCK: Mutex<()> = Mutex::new(());
+
+/// RAII guard that serializes sync data-dir overrides and restores the previous
+/// override (or clears it) when dropped.
+///
+/// Hold this for the duration of a sync test that calls [`set_data_dir`]. Async
+/// tests should use their own `tokio::sync::Mutex` plus [`TestDataDirRestore`]
+/// so the lock can be held across `.await` points.
+pub struct TestDataDirGuard {
+    previous: Option<PathBuf>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl TestDataDirGuard {
+    /// Acquire the shared sync test lock, save the current override, and install `path`.
+    pub fn set(path: PathBuf) -> Self {
+        let lock = TEST_DATA_DIR_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let previous = data_dir_override();
+        set_data_dir(path);
+        Self {
+            previous,
+            _lock: lock,
+        }
+    }
+}
+
+impl Drop for TestDataDirGuard {
+    fn drop(&mut self) {
+        match self.previous.take() {
+            Some(path) => set_data_dir(path),
+            None => clear_data_dir(),
+        }
+    }
+}
+
+/// Restores the previous data-dir override on drop (no lock — for async tests).
+pub struct TestDataDirRestore {
+    previous: Option<PathBuf>,
+}
+
+impl TestDataDirRestore {
+    /// Save the current override and install `path` until dropped.
+    pub fn set(path: PathBuf) -> Self {
+        let previous = data_dir_override();
+        set_data_dir(path);
+        Self { previous }
+    }
+}
+
+impl Drop for TestDataDirRestore {
+    fn drop(&mut self) {
+        match self.previous.take() {
+            Some(path) => set_data_dir(path),
+            None => clear_data_dir(),
+        }
+    }
 }
 
 /// Set a custom share directory (for tests or alternative layouts).

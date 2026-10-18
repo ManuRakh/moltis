@@ -354,7 +354,12 @@ impl SessionService for LiveSessionService {
                 .is_none()
             {
                 let fallback = self.default_agent_id().await;
-                let _ = self.metadata.set_agent_id(&e.key, Some(&fallback)).await;
+                // Backfill without bumping updated_at/version — listing must not
+                // reorder chats or return a version that no longer matches storage.
+                let _ = self
+                    .metadata
+                    .set_agent_id_preserving_activity(&e.key, Some(&fallback))
+                    .await;
                 e.agent_id = Some(fallback.clone());
                 fallback
             } else {
